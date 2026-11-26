@@ -1,0 +1,576 @@
+from __future__ import annotations
+
+import inspect
+import logging
+from collections.abc import Callable
+from contextlib import AbstractAsyncContextManager
+from pathlib import Path
+from types import EllipsisType
+from typing import Any, Literal
+
+from fastmcp import FastMCP
+from fastmcp.prompts import Prompt
+from fastmcp.server.auth.auth import OAuthProvider
+from fastmcp.server.middleware import Middleware
+from fastmcp.tools.tool import Tool
+from fastmcp.tools.tool_transform import ToolTransformConfig
+from mcp.server.lowlevel.server import LifespanResultT
+from mcp.types import AnyFunction, ToolAnnotations, TypeAlias
+
+from tessera.configuration import Configuration
+from tessera.mcp_logging import get_logger, normalize_log_level
+from tessera.registration import build_io_entry, make_io_mapping
+
+NotSet = ...
+NotSetT: TypeAlias = EllipsisType
+
+DuplicateBehavior = Literal["warn", "error", "replace", "ignore"]
+Transport = Literal["stdio", "http", "sse", "streamable-http"]
+
+
+class Tessera_MCP_Server(FastMCP):
+    """Extended FastMCP server with Tessera-specific features.
+
+    Provides additional functionality for tool/prompt metadata tracking,
+    configuration loading, and server.yaml generation.
+    """
+
+    def __init__(
+        self,
+        name: str | None = None,
+        instructions: str | None = None,
+        *,
+        version: str | None = None,
+        auth: OAuthProvider | None = None,
+        middleware: list[Middleware] | None = None,
+        lifespan: Callable[
+            [FastMCP[LifespanResultT]], AbstractAsyncContextManager[LifespanResultT]
+        ]
+        | None = None,
+        tool_serializer: Callable[[Any], str] | None = None,
+        on_duplicate_tools: DuplicateBehavior | None = None,
+        on_duplicate_resources: DuplicateBehavior | None = None,
+        on_duplicate_prompts: DuplicateBehavior | None = None,
+        resource_prefix_format: Literal["protocol", "path"] | None = None,
+        tool_transformations: dict[str, ToolTransformConfig] | None = None,
+        mask_error_details: bool | None = None,
+        tools: list[Tool | Callable[..., Any]] | None = None,
+        dependencies: list[str] | None = None,
+        include_tags: set[str] | None = None,
+        exclude_tags: set[str] | None = None,
+        include_fastmcp_meta: bool | None = None,
+        log_level: str | None = None,
+        debug: bool | None = None,
+        host: str | None = None,
+        port: int | None = None,
+        sse_path: str | None = None,
+        message_path: str | None = None,
+        streamable_http_path: str | None = None,
+        json_response: bool | None = None,
+        stateless_http: bool | None = None,
+    ) -> None:
+        """Initialize Tessera MCP server.
+
+        Args:
+            name: Server name (default: "Tessera")
+            instructions: Server instructions
+            version: Server version
+            auth: OAuth provider for authentication
+            middleware: List of middleware to apply
+            lifespan: Lifespan context manager
+            tool_serializer: Custom tool serializer function
+            on_duplicate_tools: Behavior for duplicate tools
+            on_duplicate_resources: Behavior for duplicate resources
+            on_duplicate_prompts: Behavior for duplicate prompts
+            resource_prefix_format: Resource prefix format
+            tool_transformations: Tool transformation configurations
+            mask_error_details: Whether to mask error details
+            tools: List of tools to register
+            dependencies: List of dependencies
+            include_tags: Tags to include
+            exclude_tags: Tags to exclude
+            include_fastmcp_meta: Whether to include FastMCP metadata
+            log_level: Logging level
+            debug: Enable debug mode
+            host: Server host
+            port: Server port
+            sse_path: SSE path
+            message_path: Message path
+            streamable_http_path: Streamable HTTP path
+            json_response: Use JSON response format
+            stateless_http: Enable stateless HTTP mode
+        """
+        name = name or "Tessera"
+        self.logger = get_logger(f"Server.{name}")
+        if log_level is not None:
+            self.logger.setLevel(normalize_log_level(log_level))
+        # FastMCP 3.x removed/renamed some __init__ parameters (e.g., resource_prefix_format)
+        # Dynamically filter to keep only parameters supported by current version for compatibility
+        super_kwargs = {
+            "version": version,
+            "auth": auth,
+            "middleware": middleware,
+            "lifespan": lifespan,
+            "tool_serializer": tool_serializer,
+            "on_duplicate_tools": on_duplicate_tools,
+            "on_duplicate_resources": on_duplicate_resources,
+            "on_duplicate_prompts": on_duplicate_prompts,
+            "resource_prefix_format": resource_prefix_format,
+            "tool_transformations": tool_transformations,
+            "mask_error_details": mask_error_details,
+            "tools": tools,
+            "dependencies": dependencies,
+            "include_tags": include_tags,
+            "exclude_tags": exclude_tags,
+            "include_fastmcp_meta": include_fastmcp_meta,
+            "log_level": log_level,
+            "debug": debug,
+            "host": host,
+            "port": port,
+            "sse_path": sse_path,
+            "message_path": message_path,
+            "streamable_http_path": streamable_http_path,
+            "json_response": json_response,
+            "stateless_http": stateless_http,
+        }
+
+        init_params = inspect.signature(super().__init__).parameters
+        filtered_kwargs = {}
+        unsupported = []
+        for key, value in super_kwargs.items():
+            if key not in init_params:
+                unsupported.append(key)
+                continue
+            # Avoid explicitly passing None to override FastMCP defaults
+            if value is None and init_params[key].default is not inspect._empty:
+                continue
+            filtered_kwargs[key] = value
+
+        if unsupported:
+            self.logger.debug("Ignoring unsupported FastMCP args: %s", unsupported)
+
+        super().__init__(name, instructions, **filtered_kwargs)
+        self.output = {}
+        self.fn_meta: dict[str, dict[str, Any]] = {}
+        self.prompt_meta: dict[str, dict[str, Any]] = {}
+        self._prompt_output_override: dict[str, str] = {}
+        self.tool(self.build, name="build")
+
+    def load_config(self, file_path: str) -> dict[str, Any]:
+        """Load YAML configuration file.
+
+        Args:
+            file_path: Path to YAML configuration file
+
+        Returns:
+            Dictionary containing configuration (empty dict if file is empty)
+        """
+        return Configuration.load_config(file_path)
+
+    @staticmethod
+    def _extract_param_names(fn: Callable[..., Any]) -> list[str]:
+        """Extract positional and keyword parameter names from function signature."""
+        sig = inspect.signature(fn)
+        return [
+            p.name
+            for p in sig.parameters.values()
+            if p.kind
+            in (
+                inspect.Parameter.POSITIONAL_ONLY,
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                inspect.Parameter.KEYWORD_ONLY,
+            )
+        ]
+
+    def _record_tool_meta(self, tool: Tool) -> None:
+        """Record tool metadata for server.yaml generation."""
+        fn = getattr(tool, "fn", None)
+        if not callable(fn):
+            return
+
+        fn_name = fn.__name__
+        if fn_name == "build":
+            return
+
+        annotations = getattr(tool, "annotations", None)
+        output = getattr(annotations, "output", None)
+        self.fn_meta[tool.name or fn_name] = {
+            "fn_name": fn_name,
+            "params": self._extract_param_names(fn),
+            "output": output,
+        }
+
+    def _record_prompt_meta(self, prompt: Prompt, output: str | None = None) -> None:
+        """Record prompt metadata for server.yaml generation."""
+        fn = getattr(prompt, "fn", None)
+        if not callable(fn):
+            return
+
+        fn_name = fn.__name__
+        self.prompt_meta[prompt.name or fn_name] = {
+            "fn_name": fn_name,
+            "params": self._extract_param_names(fn),
+            "output": output,
+        }
+
+    def _refresh_registered_meta(self) -> None:
+        """Refresh tool/prompt metadata from FastMCP's registered components."""
+        self.fn_meta = {}
+        self.prompt_meta = {}
+
+        components = getattr(self._local_provider, "_components", {})
+        if not isinstance(components, dict):
+            return
+
+        for component in components.values():
+            if isinstance(component, Tool):
+                self._record_tool_meta(component)
+                continue
+
+            if isinstance(component, Prompt):
+                fn = getattr(component, "fn", None)
+                fn_name = fn.__name__ if callable(fn) else None
+                prompt_name = component.name or fn_name
+                output = None
+                if prompt_name:
+                    output = self._prompt_output_override.get(prompt_name)
+                if output is None and fn_name:
+                    output = self._prompt_output_override.get(fn_name)
+                self._record_prompt_meta(component, output)
+
+    def tool(
+        self,
+        name_or_fn: str | AnyFunction | None = None,
+        *,
+        output: str | None = None,
+        name: str | None = None,
+        title: str | None = None,
+        description: str | None = None,
+        icons: list | None = None,
+        tags: set[str] | None = None,
+        output_schema: dict[str, Any] | None | NotSetT = NotSet,
+        annotations: ToolAnnotations | dict[str, Any] | None = None,
+        exclude_args: list[str] | None = None,
+        meta: dict[str, Any] | None = None,
+        enabled: bool | None = None,
+        **extra_kwargs: Any,
+    ) -> Any:
+        """Register a tool with Tessera-specific output annotation support.
+
+        Args:
+            name_or_fn: Tool name or function
+            output: Output specification string (e.g., "input->output")
+            name: Tool name
+            title: Tool title
+            description: Tool description
+            icons: Tool icons
+            tags: Tool tags
+            output_schema: Output schema
+            annotations: Tool annotations
+            exclude_args: Arguments to exclude
+            meta: Additional metadata
+            enabled: Whether tool is enabled
+            **extra_kwargs: Additional keyword arguments
+
+        Returns:
+            Tool registration result
+        """
+        if output is not None:
+            if annotations is None:
+                annotations = {"output": output}
+            elif isinstance(annotations, dict):
+                annotations = annotations | {"output": output}
+            else:
+                annotations.output = output
+
+        tool_kwargs = {
+            "name": name,
+            "title": title,
+            "output_schema": output_schema,
+            "description": description,
+            "icons": icons,
+            "tags": tags,
+            "annotations": annotations,
+            "exclude_args": exclude_args,
+            "meta": meta,
+            "enabled": enabled,
+            **extra_kwargs,
+        }
+
+        tool_params = inspect.signature(super().tool).parameters
+        filtered_kwargs = {}
+        unsupported = []
+        for key, value in tool_kwargs.items():
+            if key not in tool_params:
+                unsupported.append(key)
+                continue
+            if value is None and tool_params[key].default is not inspect._empty:
+                continue
+            filtered_kwargs[key] = value
+
+        if unsupported:
+            self.logger.debug("Ignoring unsupported FastMCP.tool args: %s", unsupported)
+
+        result = super().tool(name_or_fn, **filtered_kwargs)
+        return self._apply_enabled(result, name_or_fn, name, enabled, "tool")
+
+    def _apply_enabled(
+        self,
+        result: Any,
+        name_or_fn: Any,
+        name: str | None,
+        enabled: bool | None,
+        kind: Literal["tool", "prompt"],
+    ) -> Any:
+        """Preserve the public enabled option on FastMCP 3 visibility APIs."""
+        if enabled is not False or not hasattr(self, "disable"):
+            return result
+
+        def disable(registered: Any, fn: Any = None) -> Any:
+            registered_name = (
+                name
+                or (name_or_fn if isinstance(name_or_fn, str) else None)
+                or getattr(registered, "name", None)
+                or getattr(fn, "__name__", None)
+                or getattr(registered, "__name__", None)
+            )
+            self.disable(names={registered_name}, components={kind})
+            return registered
+
+        if inspect.isroutine(name_or_fn) or isinstance(result, (Tool, Prompt)):
+            return disable(result, name_or_fn)
+
+        def wrapped(fn: Callable[..., Any]) -> Any:
+            return disable(result(fn), fn)
+
+        return wrapped
+
+    def prompt(
+        self,
+        name_or_fn: str | AnyFunction | None = None,
+        *,
+        output: str | None = None,
+        name: str | None = None,
+        description: str | None = None,
+        tags: set[str] | None = None,
+        enabled: bool | None = None,
+        **extra_kwargs: Any,
+    ) -> Any:
+        """Register a prompt with Tessera-specific output annotation support.
+
+        Args:
+            name_or_fn: Prompt name or function
+            output: Output specification string
+            name: Prompt name
+            description: Prompt description
+            tags: Prompt tags
+            enabled: Whether prompt is enabled
+
+        Returns:
+            Prompt registration result or partial function for decorator usage
+
+        Raises:
+            ValueError: If classmethod is used as decorator
+            TypeError: If invalid argument combination is provided
+        """
+        if isinstance(name_or_fn, classmethod):
+            raise ValueError(  # noqa: TRY004 - preserve FastMCP decorator compatibility
+                inspect.cleandoc(
+                    """
+                    To decorate a classmethod, first define the method and then call
+                    prompt() directly on the method instead of using it as a
+                    decorator. See https://gofastmcp.com/patterns/decorating-methods
+                    for examples and more information.
+                    """
+                )
+            )
+
+        prompt_kwargs = {
+            "name": name,
+            "description": description,
+            "tags": tags,
+            "enabled": enabled,
+            **extra_kwargs,
+        }
+
+        prompt_params = inspect.signature(super().prompt).parameters
+        filtered_kwargs = {}
+        unsupported = []
+        for key, value in prompt_kwargs.items():
+            if key not in prompt_params:
+                unsupported.append(key)
+                continue
+            if value is None and prompt_params[key].default is not inspect._empty:
+                continue
+            filtered_kwargs[key] = value
+
+        if unsupported:
+            self.logger.debug(
+                "Ignoring unsupported FastMCP.prompt args: %s", unsupported
+            )
+
+        result = super().prompt(name_or_fn, **filtered_kwargs)
+        result = self._apply_enabled(result, name_or_fn, name, enabled, "prompt")
+        if output is None:
+            return result
+
+        declared_name: str | None = None
+        if isinstance(name_or_fn, str):
+            declared_name = name_or_fn
+        elif isinstance(filtered_kwargs.get("name"), str):
+            declared_name = filtered_kwargs["name"]
+
+        if inspect.isroutine(name_or_fn):
+            self._prompt_output_override[name_or_fn.__name__] = output
+            if declared_name:
+                self._prompt_output_override[declared_name] = output
+            if isinstance(result, Prompt):
+                self._prompt_output_override[result.name or name_or_fn.__name__] = (
+                    output
+                )
+            return result
+
+        if isinstance(result, Prompt):
+            fn = getattr(result, "fn", None)
+            fn_name = fn.__name__ if callable(fn) else None
+            prompt_key = result.name or fn_name
+            if prompt_key:
+                self._prompt_output_override[prompt_key] = output
+            if declared_name:
+                self._prompt_output_override[declared_name] = output
+            return result
+
+        if callable(result):
+
+            def wrapped(fn: AnyFunction) -> Any:
+                self._prompt_output_override[fn.__name__] = output
+                if declared_name:
+                    self._prompt_output_override[declared_name] = output
+                registered = result(fn)
+                if isinstance(registered, Prompt):
+                    self._prompt_output_override[registered.name or fn.__name__] = (
+                        output
+                    )
+                return registered
+
+            return wrapped
+
+        return result
+
+    def add_prompt(self, prompt: Prompt) -> Prompt:
+        """Add a prompt and track its metadata.
+
+        Args:
+            prompt: Prompt instance to add
+        """
+        registered = super().add_prompt(prompt)
+        if isinstance(registered, Prompt):
+            self._record_prompt_meta(registered, output=None)
+            return registered
+
+        self._record_prompt_meta(prompt, output=None)
+        return prompt
+
+    def add_tool(self, tool: Tool) -> Tool:
+        """Add a tool and track its metadata.
+
+        Args:
+            tool: Tool instance to add
+        """
+        registered = super().add_tool(tool)
+        if isinstance(registered, Tool):
+            self._record_tool_meta(registered)
+            return registered
+
+        self._record_tool_meta(tool)
+        return tool
+
+    def _make_io_mapping(
+        self, params: list[str], io_spec: str | None, param_cfg: dict[str, Any]
+    ) -> dict[str, str]:
+        """Create input/output mapping from parameter specification.
+
+        Args:
+            params: List of parameter names
+            io_spec: Optional I/O specification string
+            param_cfg: Parameter configuration dictionary
+
+        Returns:
+            Dictionary mapping parameter names to I/O specifications
+        """
+        return make_io_mapping(params, io_spec, param_cfg)
+
+    def _build_entry(
+        self, meta: dict[str, Any], param_cfg: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Build a tool/prompt entry for server.yaml.
+
+        Args:
+            meta: Metadata dictionary containing function info
+            param_cfg: Parameter configuration dictionary
+
+        Returns:
+            Dictionary entry for server.yaml
+
+        Raises:
+            ValueError: If output format is invalid
+        """
+        return build_io_entry(meta["params"], meta["output"], param_cfg)
+
+    def build(self, parameter_file: str) -> None:
+        """Build server.yaml configuration file from registered tools and prompts.
+
+        Args:
+            parameter_file: Path to parameter YAML file
+
+        Raises:
+            FileNotFoundError: If server code file does not exist
+        """
+        cfg_path = Path(parameter_file)
+        base_dir = cfg_path.parent
+        srv_name = base_dir.name
+        self.param_cfg = self.load_config(str(cfg_path)) if cfg_path.exists() else {}
+        self._refresh_registered_meta()
+        out_path = base_dir / "server.yaml"
+        build_yaml = {
+            "path": self.param_cfg.get(
+                "path", str(base_dir / "src" / f"{srv_name}.py")
+            ),
+            "parameter": parameter_file,
+            "tools": {
+                name: self._build_entry(self.fn_meta[name], self.param_cfg)
+                for name in self.fn_meta
+            },
+            "prompts": {
+                name: self._build_entry(self.prompt_meta[name], self.param_cfg)
+                for name in self.prompt_meta
+            },
+        }
+
+        if not Path(build_yaml["path"]).exists():
+            raise FileNotFoundError(f"Server code not found: {build_yaml['path']}")
+
+        Configuration.save_config(out_path, build_yaml)
+
+    def run(
+        self,
+        transport: Transport | None = None,
+        show_banner: bool = False,
+        **transport_kwargs: Any,
+    ) -> None:
+        """Run the MCP server with specified transport.
+
+        Args:
+            transport: Transport type (default: None, uses FastMCP default)
+            show_banner: Whether to show server banner
+            **transport_kwargs: Additional transport-specific arguments
+        """
+        super().run(
+            transport=transport,
+            show_banner=show_banner,
+            **transport_kwargs,
+        )
+
+
+# Suppress MCP library logging at WARNING level and below
+logging.getLogger("mcp").setLevel(logging.WARNING)

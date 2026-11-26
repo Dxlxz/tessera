@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 880 160" width="880" height="160" role="img" aria-label="Tessera">
+  <title>Tessera</title>
+  <g fill="#f97316">
+    <rect x="12" y="24" width="36" height="36" rx="7" opacity="0.35"/>
+    <rect x="56" y="24" width="36" height="36" rx="7" opacity="0.7"/>
+    <rect x="100" y="24" width="36" height="36" rx="7" opacity="1"/>
+    <rect x="12" y="68" width="36" height="36" rx="7" opacity="0.7"/>
+    <rect x="56" y="68" width="36" height="36" rx="7" opacity="1"/>
+    <rect x="100" y="68" width="36" height="36" rx="7" opacity="0.35"/>
+    <rect x="12" y="112" width="36" height="36" rx="7" opacity="1"/>
+    <rect x="56" y="112" width="36" height="36" rx="7" opacity="0.35"/>
+    <rect x="100" y="112" width="36" height="36" rx="7" opacity="0.7"/>
+  </g>
+  <text x="168" y="122" font-family="Inter, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="104" font-weight="700" fill="#111827" letter-spacing="-3">tessera</text>
+</svg>

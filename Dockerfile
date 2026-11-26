@@ -1,0 +1,40 @@
+FROM node:22-bookworm-slim AS frontend-builder
+
+WORKDIR /tessera-frontend
+COPY ui/frontend/package*.json ./
+RUN npm ci
+COPY ui/frontend/ ./
+RUN npm run build
+
+FROM nvidia/cuda:12.9.1-base-ubuntu24.04
+
+COPY --from=ghcr.io/astral-sh/uv:0.13.7 /uv /uvx /bin/
+COPY --from=frontend-builder /usr/local/bin/node /usr/local/bin/node
+COPY --from=frontend-builder /usr/local/lib/node_modules /usr/local/lib/node_modules
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    UV_PYTHON=python3.12 \
+    PATH="/root/.local/bin:/tessera/.venv/bin:${PATH}"
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        python3.12 python3.12-venv python3-dev \
+        curl ca-certificates git build-essential libreoffice && \
+    update-ca-certificates && \
+    ln -sf /usr/bin/python3.12 /usr/local/bin/python3 && \
+    ln -sf /usr/bin/python3.12 /usr/local/bin/python && \
+    ln -s /usr/local/lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm && \
+    ln -s /usr/local/lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx && \
+    rm -rf /var/lib/apt/lists/*
+
+WORKDIR /tessera
+COPY . .
+COPY --from=frontend-builder /tessera-frontend/dist ./ui/frontend/dist
+
+RUN uv sync --frozen --no-dev --all-extras
+RUN node --version && npx --version && test -s ui/frontend/dist/index.html
+
+EXPOSE 5050
+
+CMD ["tessera", "show", "ui", "--port", "5050", "--host", "0.0.0.0"]

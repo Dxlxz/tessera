@@ -1,0 +1,16 @@
+Tessera
+Copyright 2026 Dale Jeffrey Gilimon
+
+This product includes software developed as UltraRAG
+(https://github.com/OpenBMB/UltraRAG), Copyright 2023 OpenBMB,
+released under the Apache License, Version 2.0.
+
+UltraRAG was a joint project of THUNLP (Tsinghua University), NEUIR
+(Northeastern University), OpenBMB and AI9stars.
+
+Modifications in this distribution: the Python package and modules were
+renamed (ultrarag -> tessera), the CLI, entry point and environment
+variables renamed accordingly, and the branding, README, documentation
+surface and deployment files rebuilt.
+
+The full license text is in LICENSE.txt.

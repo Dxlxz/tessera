@@ -1,0 +1,358 @@
+import asyncio
+import os
+import sys
+from types import SimpleNamespace
+from typing import Any
+
+from . import client as _client_mod
+from .configuration import Configuration
+from .mcp_logging import get_logger
+
+_client: Any | None = None
+_client_entered = False
+_client_lock: asyncio.Lock | None = None
+_pending_shutdown: asyncio.Task | None = None
+_active_calls: set[asyncio.Task] = set()
+_shutting_down = False
+_shutdown_task: asyncio.Task | None = None
+_servers: list[str] | None = None
+SERVER_ROOT = ""
+logger = None
+
+
+def _event_loop() -> asyncio.AbstractEventLoop:
+    """Reuse an available loop, including after a caller used asyncio.run()."""
+    try:
+        loop = asyncio.get_event_loop_policy().get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+    if loop.is_closed():
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+    return loop
+
+
+async def _close_client(client: Any) -> None:
+    try:
+        for tool in await client.list_tools():
+            if tool.name.endswith("vllm_shutdown"):
+                try:
+                    await client.call_tool(tool.name, {})
+                except Exception as exc:  # noqa: BLE001 - close all resources even if one cleanup fails
+                    logger.warning("Cleanup tool %s failed: %s", tool.name, exc)
+    finally:
+        await client.__aexit__(None, None, None)
+
+
+async def _shutdown_async() -> None:
+    global _client, _client_entered, _servers, _pending_shutdown
+    global _shutting_down
+    try:
+        if _active_calls:
+            await asyncio.gather(*tuple(_active_calls), return_exceptions=True)
+        if _pending_shutdown is not None:
+            pending = _pending_shutdown
+            _pending_shutdown = None
+            await pending
+        client, entered = _client, _client_entered
+        _client = None
+        _client_entered = False
+        _servers = None
+        if client is not None and entered:
+            await _close_client(client)
+    finally:
+        _shutting_down = False
+
+
+def shutdown() -> Any:
+    """Release ToolCall services; await the returned task in async applications."""
+    global _shutting_down, _shutdown_task
+    if _shutdown_task is not None and not _shutdown_task.done():
+        return _shutdown_task
+    _shutting_down = True
+    loop = _event_loop()
+    if loop.is_running():
+        _shutdown_task = loop.create_task(_shutdown_async())
+        return _shutdown_task
+    return loop.run_until_complete(_shutdown_async())
+
+
+class _CallWrapper:
+    """Wrap a registered tool so it can be called like a Python function."""
+
+    def __init__(self, client: Any, server: str, tool: str, multi: bool):
+        self._client = client
+        self._server = server
+        self._tool = tool
+        self._multi = multi
+
+    async def _ensure_client(self):
+        global _client_entered, _pending_shutdown
+        if _client is None:
+            raise RuntimeError(
+                "[Tessera Error] ToolCall was used before `initialize()` was called."
+            )
+        async with _client_lock:
+            if _pending_shutdown is not None:
+                pending = _pending_shutdown
+                _pending_shutdown = None
+                await pending
+            if not _client_entered:
+                await _client.__aenter__()
+                _client_entered = True
+                tools = await _client.list_tools()
+                tool_name_lst = [
+                    tool.name
+                    for tool in tools
+                    if not tool.name.endswith("_build" if "_" in tool.name else "build")
+                ]
+                logger.info(f"Available tools: {tool_name_lst}")
+
+    async def _async_call(self, *args, **kwargs):
+        task = asyncio.current_task()
+        if _shutting_down and task not in _active_calls:
+            raise RuntimeError(
+                "ToolCall is shutting down; wait before starting new calls."
+            )
+        _active_calls.add(task)
+        try:
+            return await self._invoke_call(*args, **kwargs)
+        finally:
+            _active_calls.discard(task)
+
+    async def _invoke_call(self, *args, **kwargs):
+        await self._ensure_client()
+        if self._server not in (_servers or []):
+            raise AttributeError(f"Server {self._server} has not been initialized!")
+        concated = f"{self._server}_{self._tool}" if len(_servers) > 1 else self._tool
+        param_file = os.path.join(SERVER_ROOT, self._server, "parameter.yaml")
+        parameter = await asyncio.to_thread(
+            Configuration.load_parameter_config, param_file
+        )
+        metadata = await asyncio.to_thread(
+            Configuration.load_config,
+            os.path.join(SERVER_ROOT, self._server, "server.yaml"),
+        )
+        try:
+            input_param = metadata["tools"][self._tool]["input"]
+            input_keys = list(input_param.keys())
+        except (KeyError, TypeError) as e:
+            raise ValueError(
+                f"[Tessera Error] Tool {self._tool} not found in server {self._server} configuration!"
+            ) from e
+
+        for k, v in list(input_param.items()):
+            if isinstance(v, str) and v.startswith("$"):
+                key = v[1:]
+                if key not in parameter:
+                    continue
+                input_param[k] = parameter[key]
+            else:
+                input_param[k] = None
+
+        if len(args) > len(input_param):
+            raise ValueError(
+                f"[Tessera Error] Expected at most {len(input_param)} positional args, got {len(args)}"
+            )
+        for pos, value in enumerate(args):
+            key = input_keys[pos]
+            input_param[key] = value
+
+        for k, v in kwargs.items():
+            if k not in input_param:
+                raise ValueError(f"[Tessera Error] Unexpected keyword arg: {k!r}")
+            input_param[k] = v
+
+        missing = [k for k, v in input_param.items() if v is None]
+        if missing:
+            raise ValueError(f"[Tessera Error] Missing value for key(s): {missing}")
+        result = await _client.call_tool(concated, input_param)
+        return result.data if result else None
+
+    def __call__(self, *args, **kwargs):
+        """Call the tool synchronously or asynchronously based on event loop state.
+
+        Args:
+            *args: Positional arguments for the tool
+            **kwargs: Keyword arguments for the tool
+
+        Returns:
+            Tool result (synchronous) or Task (asynchronous if loop is running)
+        """
+        if _shutting_down:
+            raise RuntimeError(
+                "ToolCall is shutting down; wait before starting new calls."
+            )
+        loop = _event_loop()
+        if loop.is_running():
+            task = loop.create_task(self._async_call(*args, **kwargs))
+            _active_calls.add(task)
+            task.add_done_callback(_active_calls.discard)
+            return task
+        else:
+            return loop.run_until_complete(self._async_call(*args, **kwargs))
+
+
+class _ServerProxy(SimpleNamespace):
+    """Proxy for a specific server, e.g. `ToolCall.retriever`.
+
+    Accessing an attribute on this object (e.g. `.retriever_search`) returns a
+    `_CallWrapper` bound to that (server, tool) pair.
+    """
+
+    def __init__(self, client: Any, name: str, multi: bool):
+        """Initialize server proxy.
+
+        Args:
+            client: MCP client instance
+            name: Server name
+            multi: Whether multiple servers are configured
+        """
+        super().__init__()
+        self._client = client
+        self._name = name
+        self._multi = multi
+
+    def __getattr__(self, tool_name: str):
+        """Get a callable wrapper for the specified tool.
+
+        Args:
+            tool_name: Name of the tool to access
+
+        Returns:
+            _CallWrapper instance for the tool
+        """
+        return _CallWrapper(self._client, self._name, tool_name, self._multi)
+
+
+class _Router(SimpleNamespace):
+    """Top-level router for ToolCall.
+
+    Example:
+        ToolCall.retriever.retriever_search(...)
+        ToolCall.benchmark.get_data(...)
+    """
+
+    def __getattr__(self, server: str):
+        """Get a proxy for the specified server.
+
+        Args:
+            server: Name of the server to access
+
+        Returns:
+            _ServerProxy instance for the server
+
+        Raises:
+            AttributeError: If server has not been initialized
+        """
+        if _servers is None or server not in _servers:
+            raise AttributeError(f"Server {server} has not been initialized!")
+        return _ServerProxy(_client, server, len(_servers) > 1)
+
+
+def initialize(
+    servers: list[str], server_root: str, log_level: str = "info", no_mcp: bool = False
+) -> None:
+    """Initialize servers so they can be accessed via ToolCall.
+
+    Args:
+        servers: List of server names to initialize
+        server_root: Root directory containing server directories
+        log_level: Logging level (default: "info")
+        no_mcp: Execute local registrations in process when True
+
+    Raises:
+        ValueError: If server path does not exist
+    """
+    global _client, _client_entered, _servers, SERVER_ROOT, logger
+    global _client_lock, _pending_shutdown
+    if _shutting_down or any(not task.done() for task in _active_calls):
+        raise RuntimeError(
+            "Cannot initialize while ToolCall calls or shutdown are active. "
+            "Await their completion before reinitializing."
+        )
+    logger = get_logger("Client", log_level)
+    mcp_cfg = {"mcpServers": {}}
+    server_cfg = {}
+    for server_name in servers:
+        path = os.path.join(server_root, server_name, "src", f"{server_name}.py")
+        if not os.path.exists(path):
+            raise ValueError(f"Server path {path} does not exist!")
+        mcp_cfg["mcpServers"][server_name] = {
+            "command": sys.executable,
+            "args": [path],
+            "env": os.environ.copy(),
+        }
+        server_cfg[server_name] = {"path": path}
+
+    new_client = _client_mod.create_execution_client(mcp_cfg, server_cfg, no_mcp)
+    if _client is not None and _client_entered:
+        loop = _event_loop()
+        closing = _close_client(_client)
+        if loop.is_running():
+            _pending_shutdown = loop.create_task(closing)
+        else:
+            loop.run_until_complete(closing)
+    _client = new_client
+    SERVER_ROOT = server_root
+    _client_lock = asyncio.Lock()
+    _client_entered = False
+    _servers = servers
+
+
+ToolCall = _Router()
+
+
+async def _pipeline_async(
+    pipeline_file: str,
+    parameter_file: str,
+    log_level: str = "error",
+    no_mcp: bool = False,
+):
+    """Internal async helper that runs a full Tessera pipeline.
+
+    Args:
+        pipeline_file: Path to pipeline YAML file
+        parameter_file: Path to parameter YAML file
+        log_level: Logging level (default: "error")
+
+    Returns:
+        Pipeline execution results
+    """
+    _client_mod.logger = get_logger("Client", log_level)
+
+    return await _client_mod.run(
+        pipeline_file, parameter_file, return_all=True, no_mcp=no_mcp
+    )
+
+
+def PipelineCall(
+    pipeline_file: str,
+    parameter_file: str,
+    log_level: str = "error",
+    no_mcp: bool = False,
+):
+    """Run a full Tessera pipeline from Python.
+
+    Similar to `tessera run`, but with an explicitly provided parameter file.
+    Can be called synchronously or asynchronously based on event loop state.
+
+    Args:
+        pipeline_file: Path to pipeline YAML file
+        parameter_file: Path to parameter YAML file
+        log_level: Logging level (default: "error")
+        no_mcp: Execute local registrations in process when True
+
+    Returns:
+        Pipeline execution results (synchronous) or Task (asynchronous if loop is running)
+    """
+    loop = _event_loop()
+    if loop.is_running():
+        return loop.create_task(
+            _pipeline_async(pipeline_file, parameter_file, log_level, no_mcp)
+        )
+    else:
+        return loop.run_until_complete(
+            _pipeline_async(pipeline_file, parameter_file, log_level, no_mcp)
+        )

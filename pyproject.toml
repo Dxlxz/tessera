@@ -1,0 +1,157 @@
+[build-system]
+requires = ["setuptools>=84.2.1"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tessera"
+version = "0.3.0.2"
+description = "RAG pipelines you can see, assembled from MCP servers"
+readme = "README.md"
+license = { text = "Apache-2.0" }
+keywords = ["rag", "mcp", "llm", "retrieval", "evaluation", "agents"]
+classifiers = [
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+requires-python = ">=3.11, <3.13"
+dependencies = [
+    "rich",
+    "pandas",
+    "Jinja2",
+    "openai",
+    "httpx[socks]",
+    "python-dotenv",
+    "pydantic>=2",
+    "PyYAML",
+    "tqdm",
+    "requests",
+    # Include the CA trust updates for the emSign certificate incident.
+    "certifi>=2026.10.19",
+    "orjson",
+    "tabulate",
+    "aiohttp>=3.14.4",
+    "pillow>=13.0.0",
+    "flask",
+    "werkzeug>=3.1.9",
+    "urllib3>=2.8.0",
+    # faiss-gpu-cu12 1.14 requires NumPy 2; <2.4 also satisfies vLLM/Numba.
+    "numpy>=2,<2.4",
+    "fakeredis",
+    "pymilvus",
+    "pypinyin",
+    "jieba",
+    "charset-normalizer",
+    "python-docx",
+    "pymupdf",
+    "chonkie",
+    "tiktoken",
+]
+
+[project.optional-dependencies]
+mcp = [
+    # Keep the supported adapter API while including maintenance security fixes.
+    "fastmcp>=3.4.11,<4",
+    "mcp>=1.30.0,<2",
+    "authlib>=1.9.1,<2",
+    "PyJWT>=2.15.0,<3",
+]
+retriever = [
+    "infinity-emb",
+    "sentence-transformers",
+    "sentencepiece",
+    "openai",
+    "bm25s",
+    "faiss-gpu-cu12; sys_platform == 'linux'",
+    "faiss-cpu; sys_platform != 'linux'",
+    "exa_py",
+    "tavily-python",
+    "pymilvus",
+    "qdrant-client",
+    "numba",
+    "torch",
+    "fastapi",
+    "uvicorn",
+    "pydantic",
+]
+
+generation = [
+    # Newer cu129 wheels currently pull CUDA 13 tooling or conflict with MinerU.
+    "vllm==0.22.1",
+    "openai",
+    "transformers",
+    "torch",
+    # 0.2.4 has no CPython 3.12 Linux x86_64 wheel.
+    "xgrammar<0.2.4",
+]
+
+evaluation = [
+    "rouge-score",
+    "pytrec-eval-terrier",
+]
+
+corpus = [
+    # Use the parsing backends without the unused Gradio UI / Starlette <1 pin.
+    "mineru[pipeline,vlm]>=3.4.5,<4",
+]
+
+# LiteLLM generation backend: a pure API client, so it is kept separate from the
+# heavy `generation` extra (vllm/torch) — CPU/proxy users can install just this.
+litellm = [
+    "litellm>=1.100.4,<2.0",
+]
+
+all = [
+    "tessera[mcp]",
+    "tessera[retriever]",
+    "tessera[generation]",
+    "tessera[litellm]",
+    "tessera[corpus]",
+    "tessera[evaluation]",
+]
+
+[project.urls]
+Homepage = "https://github.com/Dxlxz/tessera"
+Repository = "https://github.com/Dxlxz/tessera"
+Issues = "https://github.com/Dxlxz/tessera/issues"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[project.scripts]
+tessera = "tessera.client:main"
+
+[dependency-groups]
+dev = [
+    "ruff",
+    "ipython",
+    "jupyter",
+    "pytest",
+]
+
+[tool.uv]
+package = true
+
+[tool.uv.sources]
+vllm = { index = "vllm-cu129" }
+torch = [
+    { index = "pytorch-cu129", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+]
+torchvision = [
+    { index = "pytorch-cu129", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+]
+torchaudio = [
+    { index = "pytorch-cu129", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu129"
+url = "https://download.pytorch.org/whl/cu129"
+explicit = true
+
+[[tool.uv.index]]
+name = "vllm-cu129"
+url = "https://wheels.vllm.ai/0.22.1/cu129"
+explicit = true

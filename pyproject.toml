@@ -24,7 +24,7 @@ dependencies = [
     "openai",
     "httpx[socks]",
     "python-dotenv",
-    "pydantic>=2",
+    "pydantic>=2.14.4",
     "PyYAML",
     "tqdm",
     "requests",

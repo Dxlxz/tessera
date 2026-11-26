@@ -152,6 +152,11 @@ hybrid weights) can be gated on a measured delta instead of a hunch.
 - [ ] Regression gate in CI: block a retrieval change that lowers the evaluation score
 - [ ] Trace viewer for a single run, keyed by step, with token and latency cost per node
 
+## See also
+
+**[Lintel](https://github.com/Dxlxz/lintel)** — guardrails, policy and decision records for the same pipelines:
+validate what goes in, repair what comes out, record every decision.
+
 ## License and lineage
 
 Apache-2.0 — see [LICENSE.txt](./LICENSE.txt) and [NOTICE](./NOTICE).

@@ -157,6 +157,9 @@ hybrid weights) can be gated on a measured delta instead of a hunch.
 **[Lintel](https://github.com/Dxlxz/lintel)** — guardrails, policy and decision records for the same pipelines:
 validate what goes in, repair what comes out, record every decision.
 
+**[Quorum](https://github.com/Dxlxz/quorum)** — a fund desk of LLM agents on top of the same ideas: risk limits,
+an approval gate and a hash-chained decision ledger.
+
 ## License and lineage
 
 Apache-2.0 — see [LICENSE.txt](./LICENSE.txt) and [NOTICE](./NOTICE).
